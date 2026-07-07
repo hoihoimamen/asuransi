@@ -683,7 +683,7 @@ for i, tipe in enumerate(total_per_type.index):
                 </div>
                 <div style="text-align:right;">
                     <div style="font-size:20px;font-weight:700;">{tidak_aktif_n}</div>
-                    <div style="font-size:11px;opacity:0.9;">Tidak Aktif</div>
+                    <div style="font-size:11px;opacity:0.9;">Tidak Aktif Transaksi</div>
                 </div>
             </div>
             <div style="font-size:11px;opacity:0.85;margin-top:6px;">{pct_aktif:.1f}% aktif dari total</div>
@@ -1036,8 +1036,12 @@ else:
 
     m1, m2 = st.columns(2)
     with m1:
-        st.metric("Employees Over Reimbursement Limit", f"{len(over_df):,}".replace(",", "."),
-                    f"{pct_of_total(len(over_df), active_employees):.1f}% dari total")
+        employees_over = over_df["NIK"].nunique()
+        st.metric(
+            "Employees Over Reimbursement Limit",
+            f"{employees_over:,}".replace(",", "."),
+            f"{pct_of_total(employees_over, active_employees):.1f}% dari total"
+        )
     with m2:
         st.metric("Total Over Limit Amount", fmt_rp(over_df["Over Limit Amount"].sum()))
 
