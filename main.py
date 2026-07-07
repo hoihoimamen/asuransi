@@ -1050,11 +1050,6 @@ for col, (_, row) in zip(cols, summary_jenis.iterrows()):
             {claim}
         </h2>
 
-        <div>
-            {row['Utilization']:.2f}% digunakan dari limit
-        </div>
-
-
         </div>
 
         </div>
