@@ -454,7 +454,7 @@ st.sidebar.markdown("---")
 st.sidebar.title("🔎 Filters")
 
 df['Band'] = df['Benefit Plan'].str[3:]
-df["Band"] = df["Band"].replace("VIP", "VI")
+df["Band"] = df["Band"].replace("VIP", "I")
 df['jenis_claim'] = df['Benefit Plan'].str[:2]
 
 years = sorted(df["Year"].dropna().unique().tolist())
