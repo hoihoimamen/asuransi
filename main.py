@@ -457,6 +457,8 @@ df['Band'] = df['Benefit Plan'].str[3:]
 df["Band"] = df["Band"].replace("VIP", "I")
 df['jenis_claim'] = df['Benefit Plan'].str[:2]
 
+
+
 years = sorted(df["Year"].dropna().unique().tolist())
 sel_years = st.sidebar.multiselect("Year", years, default=years)
 
@@ -475,6 +477,14 @@ sel_plan = st.sidebar.multiselect("jenis_claim", plan_opts, default=plan_opts)
 benef_opts = sorted(df["Beneficiary"].unique().tolist())
 sel_benef = st.sidebar.multiselect("Beneficiary", benef_opts, default=benef_opts)
 
+name_option = sorted(df["Member Name"].unique().tolist())
+option_name = st.sidebar.selectbox(
+    "Cari Nama",
+    name_option,
+    index=None,
+    placeholder="Cari Nama",
+)
+
 if st.sidebar.button("↺ Reset filters"):
     st.rerun()
 
@@ -486,6 +496,9 @@ fdf = df[
     & df["Beneficiary"].isin(sel_benef)
     & df['Band'].isin(sel_band)
 ].copy()
+
+if option_name:
+    fdf = fdf[fdf['Member Name'] == option_name]
 
 employee_per_type = (
     fdf.groupby("Tipe Pegawai")["NIK"]
