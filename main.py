@@ -795,6 +795,12 @@ with c1:
 with c2:
     st.markdown("**Berdasarkan Tipe Pegawai (% dari Total Claim)**")
 
+    colors = {
+        "Digital Talent": "#00A86B",
+        "TPPBW": "#E74C3C",
+        "Talent Mobility": "#3498DB",
+    }
+
     tp = (
         fdf.groupby("Tipe Pegawai", as_index=False)["Claim Amount"]
         .sum()
@@ -804,7 +810,9 @@ with c2:
         tp,
         names="Tipe Pegawai",
         values="Claim Amount",
-        hole=0.5,  # Donut chart
+        color="Tipe Pegawai",
+        color_discrete_map=colors,
+        hole=0.5,
     )
 
     fig.update_traces(
@@ -847,8 +855,8 @@ cols = st.columns(len(avg_claim_type))
 
 colors = {
     "Digital Talent": "#00A86B",
+    "TPPBW": "#E74C3C",
     "Talent Mobility": "#3498DB",
-    "TPPBW": "#F39C12",
     "Overall": "#6C757D",
 }
 
@@ -886,7 +894,7 @@ avg_claim_jenis = (
     .rename(columns={"Claim Amount": "Average Claim"})
 )
 
-cols = st.columns(len(avg_claim_jenis))
+cols = st.columns(max(1, len(avg_claim_jenis)))
 colors = {
     "RJ": "#3498DB",      # Rawat Jalan
     "RI": "#E74C3C",      # Rawat Inap
