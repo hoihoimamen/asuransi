@@ -498,18 +498,11 @@ if fdf.empty:
 # --------------------------------------------------------------------------
 # HEADER
 # --------------------------------------------------------------------------
-h_left, h_right = st.columns([3, 2])
-with h_left:
-    st.markdown("## 🩺 HEALTH BENEFIT UTILIZATION DASHBOARD")
-    yr_label = f"{min(sel_years)} – {max(sel_years)}" if len(sel_years) > 1 else f"{sel_years[0]}"
-    st.caption(f"Historical Analysis {yr_label}")
-with h_right:
-    st.info(
-        "**Dashboard Objective:** Menganalisis utilisasi manfaat kesehatan untuk memahami "
-        "pola penggunaan, identifikasi potensi over limit, serta estimasi dampak kebijakan "
-        "reimbursement maksimal 1x Monthly Salary.",
-        icon="🎯",
-    )
+
+st.markdown("## 🩺 HEALTH BENEFIT UTILIZATION DASHBOARD")
+yr_label = f"{min(sel_years)} – {max(sel_years)}" if len(sel_years) > 1 else f"{sel_years[0]}"
+st.caption(f"Historical Analysis 2023-2026 Q1 (Ongoing)")
+
 
 # --------------------------------------------------------------------------
 # KPI CALCULATIONS
@@ -942,25 +935,80 @@ def util_color(v):
 
 
 with c1:
-    
+
     st.markdown("**Total Claim per Benefit Plan (Rp)**")
-    fig = px.bar(plan_claim, x="Claim Amount", y="Benefit Plan", orientation="h",
-                  text=plan_claim.apply(lambda r: f"{fmt_rp(r['Claim Amount'])} ({r['pct']:.1f}%)", axis=1))
-    fig.update_traces(marker_color=BLUE)
-    fig.update_layout(height=300, xaxis_title=None, yaxis_title=None, margin=dict(t=20, b=10))
+
+    # Top 3 berdasarkan total claim
+    top3_idx = set(plan_claim["Claim Amount"].nlargest(3).index)
+
+    bar_colors = [
+        BLUE if idx in top3_idx else "#D3D3D3"
+        for idx in plan_claim.index
+    ]
+
+    fig = go.Figure(
+        go.Bar(
+            x=plan_claim["Claim Amount"],
+            y=plan_claim["Benefit Plan"],
+            orientation="h",
+            marker_color=bar_colors,
+            text=plan_claim.apply(
+                lambda r: f"{fmt_rp(r['Claim Amount'])} ({r['pct']:.1f}%)",
+                axis=1
+            ),
+            textposition="outside",
+        )
+    )
+
+    fig.update_layout(
+        height=300,
+        xaxis_title=None,
+        yaxis_title=None,
+        margin=dict(t=20, b=10),
+    )
+
     st.plotly_chart(fig, use_container_width=True)
 
 with c2:
+
     st.markdown("**Utilization per Benefit Plan (% dari Limit)**")
-    fig = go.Figure(go.Bar(
-        x=plan_util["utilization"], y=plan_util["Benefit Plan"], orientation="h",
-        marker_color=[util_color(v) for v in plan_util["utilization"]],
-        text=plan_util["utilization"].apply(lambda v: f"{v:.1f}%"),
-        textposition="outside",
-    ))
-    fig.update_layout(height=300, xaxis_title=None, yaxis_title=None, margin=dict(t=20, b=10),
-                        xaxis=dict(range=[0, max(100, plan_util["utilization"].max() * 1.15 if len(plan_util) else 100)]))
+
+    top3_idx = set(plan_util["utilization"].nlargest(3).index)
+
+    bar_colors = [
+        BLUE if idx in top3_idx else "#D3D3D3"
+        for idx in plan_util.index
+    ]
+
+    fig = go.Figure(
+        go.Bar(
+            x=plan_util["utilization"],
+            y=plan_util["Benefit Plan"],
+            orientation="h",
+            marker_color=bar_colors,
+            text=plan_util["utilization"].apply(lambda v: f"{v:.1f}%"),
+            textposition="outside",
+        )
+    )
+
+    fig.update_layout(
+        height=300,
+        xaxis_title=None,
+        yaxis_title=None,
+        margin=dict(t=20, b=10),
+        xaxis=dict(
+            range=[
+                0,
+                max(
+                    100,
+                    plan_util["utilization"].max() * 1.15 if len(plan_util) else 100,
+                ),
+            ]
+        ),
+    )
+
     st.plotly_chart(fig, use_container_width=True)
+
     if plan_util["Benefit Limit"].isna().any():
         st.caption("Some Benefit Plans are missing limit data under the current filters.")
 
