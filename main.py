@@ -9,13 +9,17 @@ Run with:
 """
 
 import io
-import os
+from google import genai
 import re
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
+
+client = genai.Client(
+    api_key=st.secrets["GEMINI_API_KEY"]
+)
 
 # --------------------------------------------------------------------------
 # PAGE CONFIG & STYLE
@@ -169,143 +173,95 @@ PREFIX_NOTE = {
     "RG": "Rawat Gigi",
     "BT": "Alat Kacamata / Rehabilitasi",
 }
-PAREA_TIPE_MAP = {
-    "AA": "TPPBW",
-    "AD": "Talent Mobility",
-    "AG": "Digital Talent",
-}
-# Manual fallback for Provider limits that can't be learned from any existing
-# transaction (no employee at that tier ever claimed that plan via Provider).
-# Add more "PLAN-TIER": amount entries here as they're confirmed.
-MANUAL_LIMIT_OVERRIDES = {
-    "BT-I": 3_500_000,
-}
+
+# --------------------------------------------------------------------------
+# WIDE-FORMAT INGESTION
+# --------------------------------------------------------------------------
+# The claims source can now arrive "wide": one row per NIK+Tahun, with every
+# benefit x transaction-type x beneficiary combination as its own column
+# (e.g. "RJ_Provider_Pegawai", "BT_Reimburse_Keluarga", ...), plus per-row
+# entitlement limits ("Limit_Provider_RJ", ..., "Limit_Reimburse") and a
+# "Status Employee" flag. This section detects that shape and melts it back
+# into the long, one-row-per-transaction-type layout (REQUIRED_COLS) that the
+# rest of the dashboard is built around, so nothing downstream needs to change.
+
+WIDE_FORMAT_MARKER_COLS = {"Tahun", "Nama", "Band"}
+WIDE_BENEFICIARIES = ["Pegawai", "Keluarga"]
 
 
-def build_employee_master(karyawan_df: pd.DataFrame) -> pd.DataFrame:
-    """Turn a 'karyawan.xlsx'-style wage table (one row per wage component per
-    employee) into one row per employee, with Monthly Salary = sum of all their
-    wage-component Amounts (Gaji, Insentif, Tunjangan, etc.), plus their earliest
-    Start date (join year) used to avoid zero-filling years before they joined."""
-    k = karyawan_df.copy()
-    k.columns = [str(c).strip() for c in k.columns]
-    required = ["Pers.no.", "Personnel Number", "PArea", "PS group", "Amount"]
-    missing = [c for c in required if c not in k.columns]
-    if missing:
-        st.sidebar.error(f"karyawan.xlsx is missing column(s): {', '.join(missing)} — skipping zero-fill.")
-        return None
-    k["NIK"] = k["Pers.no."].astype(str).str.strip()
-    k["Amount"] = k["Amount"].apply(parse_id_number)
-
-    if "Start date" in k.columns:
-        k["_start_dt"] = pd.to_datetime(k["Start date"], format="%d.%m.%Y", errors="coerce")
-        if k["_start_dt"].isna().all():
-            # fallback: let pandas guess the format if the fixed format didn't match
-            k["_start_dt"] = pd.to_datetime(k["Start date"], dayfirst=True, errors="coerce")
-    else:
-        k["_start_dt"] = pd.NaT
-
-    emp = k.groupby("NIK").agg(
-        Monthly_Salary=("Amount", "sum"),
-        Personnel_Number=("Personnel Number", "first"),
-        PS_group=("PS group", "first"),
-        PArea=("PArea", "first"),
-        Start_Date=("_start_dt", "min"),
-    ).reset_index()
-    emp["Member Name"] = emp["Personnel_Number"].astype(str).str.replace(
-        r"^(Bpk\.|Ibu)\s*", "", regex=True
-    ).str.strip()
-    emp["Tier"] = emp["PS_group"].astype(str).str.strip()
-    emp["Start_Year"] = emp["Start_Date"].dt.year
-    emp["Tipe Pegawai"] = emp["PArea"].map(PAREA_TIPE_MAP).fillna("Tidak Diketahui")
-    return emp
+def is_wide_format(df: pd.DataFrame) -> bool:
+    cols = {str(c).strip() for c in df.columns}
+    return WIDE_FORMAT_MARKER_COLS.issubset(cols)
 
 
-def build_zero_fill_rows(claims_df: pd.DataFrame, employee_master: pd.DataFrame):
-    """For every employee in employee_master, for every Year already present in
-    claims_df AND >= that employee's join year (from 'Start date' — an employee
-    who joined in 2024 gets no 2023 rows; one who joined in 2026 gets none at all
-    since the study period is 2023-2025), for the 4 main benefit categories at
-    that employee's tier (from PS group), for both Provider and Reimburse: if
-    that exact (NIK, Year, Benefit Plan, Transaction Type) combination has no
-    real transaction, add a synthetic Claim Amount = 0 row carrying the correct
-    entitlement Limit, so employees who never claimed anything (or only claimed
-    some benefits) still count fully toward Active Employees / Total Limit /
-    Utilization.
-
-    Returns (zero_df, info dict) — info has diagnostics for the sidebar.
-    """
-    years_in_scope = sorted(claims_df["Year"].dropna().unique().tolist())
-    existing_keys = set(zip(claims_df["NIK"], claims_df["Year"], claims_df["Benefit Plan"], claims_df["Transaction Type"]))
-
-    provider_limit_lookup = (
-        claims_df.loc[claims_df["Transaction Type"] == "Provider"]
-        .drop_duplicates("Benefit Plan")
-        .set_index("Benefit Plan")["Benefit Limit"]
-        .to_dict()
-    )
-    # Fill in any plan+tier combo that has no learnable limit with a manual override.
-    for plan_code, amount in MANUAL_LIMIT_OVERRIDES.items():
-        if plan_code not in provider_limit_lookup or pd.isna(provider_limit_lookup.get(plan_code)):
-            provider_limit_lookup[plan_code] = amount
-
-    emp = employee_master
-    n_no_start_date = int(emp["Start_Year"].isna().sum())
-    n_joined_after_scope = int((emp["Start_Year"] > max(years_in_scope)).sum()) if years_in_scope else 0
+def melt_wide_claims(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Melt the wide per-NIK-per-Year claims table into the long transaction-
+    level format the dashboard expects. Every benefit/transaction/beneficiary
+    cell becomes its own row, even when the claim amount is 0 — that's what
+    keeps employees who didn't claim anything counted correctly as Active
+    Employees with a full entitlement (Total Limit)."""
+    w = raw_df.copy()
+    w.columns = [str(c).strip() for c in w.columns]
+    w["NIK"] = w["NIK"].astype(str).str.strip()
+    w["Year"] = pd.to_numeric(w["Tahun"], errors="coerce").astype("Int64")
+    w["Member Name"] = w["Nama"].astype(str).str.strip()
+    w["Tipe Pegawai"] = w.get("Tipe Pegawai", "").astype(str).str.strip()
+    w["Band"] = w["Band"].astype(str).str.strip()
+    status_col = w["Status Employee"] if "Status Employee" in w.columns else ""
 
     rows = []
-    missing_limit_combos = set()
-    used_overrides = set()
-    skipped_no_tier = 0
-    for _, e in emp.iterrows():
-        tier = e["Tier"]
-        if pd.isna(tier) or tier == "" or tier == "nan":
-            skipped_no_tier += 1
-            continue
-        start_year = e["Start_Year"]  # NaN if unknown -> don't restrict (assume always eligible)
-        for year in years_in_scope:
-            if pd.notna(start_year) and year < start_year:
-                continue  # not employed yet that year
-            for prefix in BENEFIT_PREFIXES:
-                plan_code = f"{prefix}-{tier}"
-                for txn in TXN_TYPES:
-                    key = (e["NIK"], year, plan_code, txn)
-                    if key in existing_keys:
+    for idx, r in w.iterrows():
+        band = r["Band"]
+        status = r.get("Status Employee", None) if "Status Employee" in w.columns else None
+        for prefix in BENEFIT_PREFIXES:
+            plan_code = f"{prefix}-{band}"
+            note = PREFIX_NOTE.get(prefix, prefix)
+            limit_provider = parse_id_number(r.get(f"Limit_Provider_{prefix}"))
+            limit_reimburse = parse_id_number(r.get("Limit_Reimburse"))
+            for txn in TXN_TYPES:
+                limit = limit_provider if txn == "Provider" else limit_reimburse
+                for benef in WIDE_BENEFICIARIES:
+                    col = f"{prefix}_{txn}_{benef}"
+                    if col not in w.columns:
                         continue
-                    if txn == "Provider":
-                        limit = provider_limit_lookup.get(plan_code, np.nan)
-                        if pd.isna(limit):
-                            missing_limit_combos.add(plan_code)
-                        elif plan_code in MANUAL_LIMIT_OVERRIDES:
-                            used_overrides.add(plan_code)
-                    else:
-                        limit = e["Monthly_Salary"]
-                    rows.append({
-                        "NIK": e["NIK"],
-                        "Member Name": e["Member Name"],
-                        "Year": year,
-                        "Tipe Pegawai": e["Tipe Pegawai"],
+                    claim = parse_id_number(r.get(col))
+                    if pd.isna(claim):
+                        claim = 0.0
+                    row = {
+                        "NIK": r["NIK"],
+                        "Member Name": r["Member Name"],
+                        "Year": r["Year"],
+                        "Tipe Pegawai": r["Tipe Pegawai"],
                         "Transaction Type": txn,
                         "Benefit Plan": plan_code,
-                        "Benefit Note": PREFIX_NOTE[prefix],
-                        "Beneficiary": "Pegawai",
-                        "Claim Amount": 0.0,
+                        "Benefit Note": note,
+                        "Beneficiary": benef,
+                        "Claim Amount": claim,
                         "Benefit Limit": limit,
-                    })
+                    }
+                    if status is not None:
+                        row["Status Employee"] = status
+                    rows.append(row)
 
-    zero_df = pd.DataFrame(rows, columns=REQUIRED_COLS)
-    n_unmapped_parea = int((emp["Tipe Pegawai"] == "Tidak Diketahui").sum())
-    info = {
-        "n_employees_master": len(employee_master),
-        "n_zero_rows": len(zero_df),
-        "n_unmapped_parea": n_unmapped_parea,
-        "n_no_start_date": n_no_start_date,
-        "n_joined_after_scope": n_joined_after_scope,
-        "missing_limit_combos": sorted(missing_limit_combos),
-        "used_overrides": sorted(used_overrides),
-        "skipped_no_tier": skipped_no_tier,
-    }
-    return zero_df, info
+    long_df = pd.DataFrame(rows)
+    extra_cols = REQUIRED_COLS + (["Status Employee"] if "Status Employee" in w.columns else [])
+    return long_df[extra_cols]
+
+
+def build_salary_from_wide(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Limit_Reimburse in the wide file IS each employee's reimbursement
+    ceiling (1x Monthly Salary) for that year — so it can be used directly as
+    the salary mapping for Sections 4 & 5, per NIK **and year** (more precise
+    than a single NIK-only salary file, since salary changes year to year)."""
+    if "Limit_Reimburse" not in raw_df.columns:
+        return pd.DataFrame(columns=["NIK", "Year", "Monthly Salary"])
+    s = raw_df[["NIK", "Tahun", "Limit_Reimburse"]].copy()
+    s.columns = ["NIK", "Year", "Monthly Salary"]
+    s["NIK"] = s["NIK"].astype(str).str.strip()
+    s["Year"] = pd.to_numeric(s["Year"], errors="coerce").astype("Int64")
+    s["Monthly Salary"] = s["Monthly Salary"].apply(parse_id_number)
+    return s.dropna(subset=["Monthly Salary"]).drop_duplicates(subset=["NIK", "Year"])
+
 
 def clean_claims(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -355,14 +311,6 @@ def fmt_pct(value):
 # --------------------------------------------------------------------------
 # DATA — always load straight from the bundled data.xlsx
 # --------------------------------------------------------------------------
-# BUNDLED_PATH = "data.xlsx"
-
-# if not os.path.exists(BUNDLED_PATH):
-#     st.error(f"`{BUNDLED_PATH}` was not found next to app.py. Place your workbook there and rerun.")
-#     st.stop()
-
-# with open(BUNDLED_PATH, "rb") as f:
-#     file_bytes = f.read()
 
 uploaded_file = st.sidebar.file_uploader(
     "Upload Data Transaksi",
@@ -378,6 +326,7 @@ file_bytes = uploaded_file.getvalue()
 sheet_names = list_excel_sheets(file_bytes)
 claims_sheet = find_sheet(sheet_names, "working") or sheet_names[0]
 raw_df = read_excel_sheet(file_bytes, claims_sheet)
+raw_df.columns = [str(c).strip() for c in raw_df.columns]
 
 salary_df = None
 master_sheet = find_sheet(sheet_names, "employee")
@@ -385,67 +334,258 @@ if master_sheet:
     master_df = read_excel_sheet(file_bytes, master_sheet)
     salary_df = build_salary_df_from_master(master_df)
 
-df = clean_claims(raw_df)
+wide_mode = is_wide_format(raw_df)
+if wide_mode:
+    n_source_rows = len(raw_df)
+    long_df = melt_wide_claims(raw_df)
+    df = clean_claims(long_df)
 
-# st.sidebar.title("📁 Data")
-# st.sidebar.caption(f"Loaded from `{BUNDLED_PATH}` — claims: sheet '{claims_sheet}'"
-#                      + (f", salary: sheet '{master_sheet}'" if salary_df is not None else ""))
-# if salary_df is None:
-#     st.sidebar.warning("No employee salary sheet detected — Sections 4 & 5 will be unavailable.")
+    # Limit_Reimburse in the wide file is a direct, per-year salary/entitlement
+    # figure — prefer it over any separately-uploaded (NIK-only) salary mapping.
+    wide_salary_df = build_salary_from_wide(raw_df)
+    if not wide_salary_df.empty:
+        salary_df = wide_salary_df
 
-# --- Zero-fill: employees with no (or partial) transactions still count fully ---
-uploaded_file_karyawan = st.sidebar.file_uploader(
-    "Upload karyawan.xlsx",
-    type=["xlsx"],
-    key="karyawan"
-)
+    st.sidebar.caption(
+        f"📐 Wide-format data terdeteksi: {n_source_rows:,} baris NIK×Tahun "
+        f"diperluas jadi {len(df):,} baris transaksi.".replace(",", ".")
+    )
+else:
+    df = clean_claims(raw_df)
 
-if uploaded_file_karyawan is not None:
-    karyawan_bytes = uploaded_file_karyawan.getvalue()
-    karyawan_sheets = list_excel_sheets(karyawan_bytes)
-    karyawan_sheet = karyawan_sheets[0]
-    karyawan_raw = read_excel_sheet(karyawan_bytes, karyawan_sheet)
-    employee_master = build_employee_master(karyawan_raw)
+# --------------------------------------------------------------------------
+# AI ASSISTANT — data + prompt setup (UI is rendered as a floating overlay
+# further below, once the full dataset and filters exist)
+# --------------------------------------------------------------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-    if employee_master is not None:
-        zero_df, info = build_zero_fill_rows(df, employee_master)
+if "chat_open" not in st.session_state:
+    st.session_state.chat_open = False
 
-        df = pd.concat([df, zero_df], ignore_index=True, sort=False)
-        
-        if info["n_unmapped_parea"]:
-            st.sidebar.caption(
-                f"⚠️ {info['n_unmapped_parea']} employees have a PArea outside "
-                f"AA/AD/AG (mapped to TPPBW/Talent Mobility/Digital Talent) — labeled 'Tidak Diketahui'."
-            )
-        if info["n_no_start_date"]:
-            st.sidebar.caption(
-                f"⚠️ {info['n_no_start_date']} employees have no readable Start date — "
-                f"treated as eligible for all years (2023-2025) since join year is unknown."
-            )
-        # if info["n_joined_after_scope"]:
-        #     st.sidebar.caption(
-        #         f"ℹ️ {info['n_joined_after_scope']} employees joined after 2025 — correctly excluded from all zero-fill rows."
-        #     )
-        if info["missing_limit_combos"]:
-            st.sidebar.caption(
-                f"⚠️ No Provider limit could be inferred for: {', '.join(info['missing_limit_combos'])} "
-                f"(no existing claim at that tier to learn the limit from) — those entitlements are excluded from Total Limit."
-            )
-        # if info["used_overrides"]:
-        #     st.sidebar.caption(
-        #         f"✅ Manual limit override used for: {', '.join(info['used_overrides'])}."
-        #     )
-        if info["skipped_no_tier"]:
-            st.sidebar.caption(f"⚠️ {info['skipped_no_tier']} employees skipped (no PS group / tier).")
+SYSTEM_PROMPT = """
+    You are an AI Health Benefit Data Analyst.
 
-        # Also fold newly-discovered employees' salary into salary_df for Sections 4 & 5
-        emp_salary = employee_master.rename(columns={"Monthly_Salary": "Monthly Salary"})[["NIK", "Monthly Salary"]]
-        if salary_df is None:
-            salary_df = emp_salary.dropna()
-        else:
-            salary_df = pd.concat([salary_df, emp_salary]).dropna().drop_duplicates(subset="NIK", keep="first")
+    You answer questions ONLY using the uploaded Health Benefit Excel dataset.
+
+    Never use outside knowledge.
+    Never guess.
+    If the answer cannot be calculated from the uploaded data, say so.
+
+    =====================================================
+    DATA DEFINITIONS
+    =====================================================
+
+    Claim Amount
+    - Amount claimed by an employee.
+
+    Benefit Limit
+    - Annual claim limit.
+
+    Transaction Type
+    - Provider
+    - Reimburse
+
+    Benefit Plan
+    Example:
+    RJ-IV
+    RI-IV
+    RG-IV
+    BT-IV
+
+    Band
+    Employee band extracted from Benefit Plan.
+
+    =====================================================
+    IMPORTANT CALCULATION RULES
+    =====================================================
+
+    Provider Limit
+
+    The Provider Benefit Limit is counted ONLY ONCE for each:
+
+    - Employee (NIK)
+    - Year
+    - Benefit Plan
+
+    Do NOT sum duplicated Provider limits that appear on multiple transaction rows.
+
+    Equivalent logic:
+
+    drop_duplicates(
+        subset=["NIK","Year","Benefit Plan"]
+    )
+
+    then sum Benefit Limit.
 
 
+    -----------------------------------------------------
+
+    Reimbursement Limit
+
+    The Reimbursement Benefit Limit represents
+    ONE MONTH SALARY.
+
+    It is counted ONLY ONCE for each
+
+    - Employee (NIK)
+    - Year
+
+    Do NOT multiply by Benefit Plan.
+
+    Equivalent logic:
+
+    drop_duplicates(
+        subset=["NIK","Year"]
+    )
+
+    then sum Benefit Limit.
+
+    -----------------------------------------------------
+
+    Total Annual Limit
+
+    Total Limit =
+
+    Provider Limit
+    +
+    Reimbursement Limit
+
+    -----------------------------------------------------
+
+    Over Reimbursement
+
+    Group by
+
+    NIK
+    Year
+
+    sum Claim Amount where
+    Transaction Type == Reimburse
+
+    Compare against the yearly Reimbursement Limit.
+
+    -----------------------------------------------------
+
+    Employee Over Any Benefit
+
+    Group by
+
+    NIK
+    Year
+    Benefit Plan
+    Transaction Type
+
+    Claim =
+    SUM(Claim Amount)
+
+    Limit =
+    MAX(Benefit Limit)
+
+    Employee is Over Limit if
+
+    Claim > Limit
+
+    -----------------------------------------------------
+
+    Average
+
+    Average Claim =
+    Average of Claim Amount
+
+    unless user specifies otherwise.
+
+    -----------------------------------------------------
+
+    Ranking
+
+    When user asks:
+
+    Top
+    Highest
+    Largest
+    Lowest
+    Bottom
+
+    Always sort correctly.
+
+    -----------------------------------------------------
+
+    Comparison
+
+    If user compares years,
+    calculate each year independently before comparing.
+
+    -----------------------------------------------------
+
+    Currency
+
+    Always use Indonesian Rupiah formatting.
+
+    Example
+
+    Rp 1.245.000
+
+    -----------------------------------------------------
+
+    When possible answer using
+
+    1. Short explanation
+    2. Table
+    3. Final conclusion
+
+    =====================================================
+    EXAMPLE QUESTIONS
+    =====================================================
+
+    Top 10 claim tahun 2025
+
+    Top reimbursement
+
+    Band dengan claim terbesar
+
+    Provider terbesar
+
+    Utilization per benefit plan
+
+    Top 5 employee claim
+
+    Average claim per employee
+
+    Claim per beneficiary
+
+    Provider vs Reimburse
+
+    Potential saving
+
+    Employee over reimbursement limit
+
+    Employee over any benefit
+
+    Compare 2024 vs 2025
+
+    Trend claim
+
+    Claim by transaction type
+
+    Claim by benefit plan
+
+    Claim by band
+
+    Claim by employee type
+"""
+
+if "gemini_file" not in st.session_state:
+
+    df.to_json(
+        "claims.json",
+        orient="records",
+        force_ascii=False
+    )
+
+    st.session_state.gemini_file = client.files.upload(
+        file="claims.json"
+    )
 
 # --------------------------------------------------------------------------
 # SIDEBAR — FILTERS
@@ -456,8 +596,6 @@ st.sidebar.title("🔎 Filters")
 df['Band'] = df['Benefit Plan'].str[3:]
 df["Band"] = df["Band"].replace("VIP", "I")
 df['jenis_claim'] = df['Benefit Plan'].str[:2]
-
-
 
 years = sorted(df["Year"].dropna().unique().tolist())
 sel_years = st.sidebar.multiselect("Year", years, default=years)
@@ -476,6 +614,12 @@ sel_plan = st.sidebar.multiselect("jenis_claim", plan_opts, default=plan_opts)
 
 benef_opts = sorted(df["Beneficiary"].unique().tolist())
 sel_benef = st.sidebar.multiselect("Beneficiary", benef_opts, default=benef_opts)
+
+if "Status Employee" in df.columns:
+    status_opts = sorted(df["Status Employee"].dropna().unique().tolist())
+    sel_status = st.sidebar.multiselect("Status Employee", status_opts, default=status_opts)
+else:
+    sel_status = None
 
 name_option = sorted(df["Member Name"].unique().tolist())
 option_name = st.sidebar.selectbox(
@@ -496,6 +640,9 @@ fdf = df[
     & df["Beneficiary"].isin(sel_benef)
     & df['Band'].isin(sel_band)
 ].copy()
+
+if sel_status is not None:
+    fdf = fdf[fdf["Status Employee"].isin(sel_status)]
 
 if option_name:
     fdf = fdf[fdf['Member Name'] == option_name]
@@ -581,25 +728,34 @@ fig.update_layout(
 grp_over["over"] = grp_over["claim"] > grp_over["limit"]
 employees_over_any = grp_over.loc[grp_over["over"], "NIK"].nunique()
 
-# Reimbursement-policy potential saving (needs salary)
-has_salary = salary_df is not None and not salary_df.empty
-if has_salary:
-    reimb_by_emp = (
-        fdf.loc[fdf["Transaction Type"] == "Reimburse"]
-        .groupby(["NIK", "Year"], as_index=False)["Claim Amount"].sum()
-        .rename(columns={"Claim Amount": "Reimbursement Claim"})
-    )
-    reimb_by_emp = reimb_by_emp.merge(salary_df, on="NIK", how="left")
-    reimb_by_emp["Monthly Salary"] = reimb_by_emp["Monthly Salary"].fillna(0)
-    reimb_by_emp["Over Limit Amount"] = (
-        reimb_by_emp["Reimbursement Claim"] - reimb_by_emp["Monthly Salary"]
-    ).clip(lower=0)
-    reimb_by_emp["Over Limit"] = reimb_by_emp["Over Limit Amount"] > 0
-    n_over_reimb = int(reimb_by_emp["Over Limit"].sum())
-    potential_saving = reimb_by_emp["Over Limit Amount"].sum()
-else:
-    n_over_reimb = None
-    potential_saving = None
+# Reimbursement-policy potential saving.
+# The per-row "Benefit Limit" on Reimburse transactions already IS the 1x
+# Monthly Salary ceiling (carried straight from the source file), so this no
+# longer needs a separately-uploaded salary mapping. An uploaded salary_df
+# (e.g. from an "employee" sheet in the same workbook) is only used to
+# backfill NIK+Year combos where that limit happens to be missing.
+reimb_by_emp = (
+    fdf.loc[fdf["Transaction Type"] == "Reimburse"]
+    .groupby(["NIK", "Year"], as_index=False)
+    .agg(**{"Reimbursement Claim": ("Claim Amount", "sum"), "Monthly Salary": ("Benefit Limit", "max")})
+)
+
+if salary_df is not None and not salary_df.empty:
+    merge_keys = ["NIK", "Year"] if "Year" in salary_df.columns else ["NIK"]
+    fallback = salary_df.rename(columns={"Monthly Salary": "Monthly Salary_fallback"})
+    reimb_by_emp = reimb_by_emp.merge(fallback, on=merge_keys, how="left")
+    reimb_by_emp["Monthly Salary"] = reimb_by_emp["Monthly Salary"].fillna(reimb_by_emp["Monthly Salary_fallback"])
+    reimb_by_emp = reimb_by_emp.drop(columns=["Monthly Salary_fallback"])
+
+reimb_by_emp["Monthly Salary"] = reimb_by_emp["Monthly Salary"].fillna(0)
+reimb_by_emp["Over Limit Amount"] = (
+    reimb_by_emp["Reimbursement Claim"] - reimb_by_emp["Monthly Salary"]
+).clip(lower=0)
+reimb_by_emp["Over Limit"] = reimb_by_emp["Over Limit Amount"] > 0
+
+has_salary = bool(reimb_by_emp["Monthly Salary"].gt(0).any())
+n_over_reimb = int(reimb_by_emp["Over Limit"].sum())
+potential_saving = reimb_by_emp["Over Limit Amount"].sum()
 
 # --------------------------------------------------------------------------
 # KPI CARDS
@@ -696,6 +852,50 @@ for i, tipe in enumerate(total_per_type.index):
             <div style="font-size:11px;opacity:0.85;margin-top:6px;">{pct_aktif:.1f}% aktif dari total</div>
             </div>
             """, unsafe_allow_html=True)
+
+# --------------------------------------------------------------------------
+# TREND CLAIM PER TAHUN
+# --------------------------------------------------------------------------
+st.markdown('<div class="section-header">📈 TREND CLAIM PER TAHUN</div>', unsafe_allow_html=True)
+
+trend_total = fdf.groupby("Year", as_index=False)["Claim Amount"].sum().sort_values("Year")
+trend_by_txn = (
+    fdf.groupby(["Year", "Transaction Type"], as_index=False)["Claim Amount"]
+    .sum()
+    .sort_values("Year")
+)
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(
+    x=trend_total["Year"], y=trend_total["Claim Amount"],
+    mode="lines+markers+text",
+    name="Total Claim",
+    line=dict(color=NAVY, width=3),
+    marker=dict(size=8),
+    text=[fmt_rp(v) for v in trend_total["Claim Amount"]],
+    textposition="top center",
+))
+for txn, color in [("Provider", BLUE), ("Reimburse", PURPLE)]:
+    sub = trend_by_txn[trend_by_txn["Transaction Type"] == txn]
+    if sub.empty:
+        continue
+    fig.add_trace(go.Scatter(
+        x=sub["Year"], y=sub["Claim Amount"],
+        mode="lines+markers",
+        name=txn,
+        line=dict(color=color, width=2, dash="dot"),
+        marker=dict(size=6),
+    ))
+
+fig.update_layout(
+    height=320,
+    xaxis=dict(title="Tahun", dtick=1),
+    yaxis=dict(title="Total Claim (Rp)"),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    margin=dict(t=40, b=10),
+)
+st.plotly_chart(fig, use_container_width=True)
+
 # --------------------------------------------------------------------------
 # SECTION 1 — BERAPA UTILISASI MANFAAT KESEHATAN?
 # --------------------------------------------------------------------------
@@ -772,6 +972,49 @@ with c2:
         c1.metric("💰 Remaining", f"Rp {remaining:,.0f}".replace(",", "."))
     with c2:
         c2.metric("📦 Total Limit", f"Rp {total:,.0f}".replace(",", "."))
+
+st.markdown("---")
+st.markdown("**Total Claim vs 1 Month Salary Limit**")
+used = provider_claim + reimburse_claim
+total_reimburse_limit = limit_reimburse_unique["Benefit Limit"].sum()
+remaining_reimburse_limit = max(total_reimburse_limit - used, 0)
+utilization_reimburse = (used / total_reimburse_limit * 100) if total_reimburse_limit else 0
+
+fig = go.Figure()
+fig.add_trace(go.Bar(
+    y=[""],
+    x=[utilization_reimburse],
+    orientation="h",
+    marker_color=BLUE,
+    text=[f"{utilization_reimburse:.1f}%"],
+    textposition="inside",
+    insidetextanchor="start",
+    hovertemplate="Used: %{x:.1f}%<extra></extra>"
+))
+fig.add_trace(go.Bar(
+    y=[""],
+    x=[100 - min(utilization_reimburse, 100)],
+    orientation="h",
+    marker_color="#E5E7EB",
+    hoverinfo="skip"
+))
+fig.update_layout(
+    barmode="stack",
+    height=100,
+    margin=dict(l=0, r=0, t=0, b=0),
+    xaxis=dict(range=[0, 100], ticksuffix="%", showgrid=False, zeroline=False),
+    yaxis=dict(showticklabels=False),
+    showlegend=False,
+)
+st.plotly_chart(fig, use_container_width=True)
+
+pc1, pc2, pc3 = st.columns(3)
+with pc1:
+    pc1.metric("💰 Used", f"Rp {used:,.0f}".replace(",", "."))
+with pc2:
+    pc2.metric("💰 Remaining Limit", f"Rp {remaining_reimburse_limit:,.0f}".replace(",", "."))
+with pc3:
+    pc3.metric("📦 Total Limit", f"Rp {total_reimburse_limit:,.0f}".replace(",", "."))
 
 # KPI di bawah progress bar
 
@@ -1083,8 +1326,8 @@ st.markdown('<div class="section-header">④ SIAPA YANG MELEBIHI LIMIT REIMBURSE
 
 if not has_salary:
     st.warning(
-        "This section needs each employee's **Monthly Salary**, which isn't part of the claims "
-        "data. Upload a salary mapping file (columns: `NIK`, `Monthly Salary`) in the sidebar to unlock it."
+        "No Reimburse limit (1x Monthly Salary) is available for the current filter, "
+        "so this section can't be computed."
     )
 else:
     over_df = reimb_by_emp[reimb_by_emp["Over Limit"]].copy()
@@ -1109,7 +1352,6 @@ else:
         )
     with m2:
         st.metric("Total Over Limit Amount", fmt_rp(over_df["Over Limit Amount"].sum()))
-
 
     top10 = over_df.copy()
     top10.insert(0, "Rank", range(1, len(top10) + 1))
@@ -1136,13 +1378,81 @@ else:
 
     st.dataframe(top10_display)
 
+st.markdown("---")
+st.markdown("**🧪 Simulasi: Total Claim (Provider + Reimburse) vs Limit Reimburse**")
+st.caption(
+    "Skenario: seluruh klaim setahun (Provider + Reimburse digabung) dibandingkan "
+    "terhadap satu batas tunggal, yaitu Limit Reimburse (1x Monthly Salary) tahun itu — "
+    "bukan terhadap limit masing-masing plan. Ini murni simulasi, bukan aturan aktual."
+)
+
+if not has_salary:
+    st.warning(
+        "No Reimburse limit (1x Monthly Salary) is available for the current filter, "
+        "so this simulation can't be run."
+    )
+else:
+    total_claim_by_emp_year = (
+        fdf.groupby(["NIK", "Year"], as_index=False)["Claim Amount"]
+        .sum()
+        .rename(columns={"Claim Amount": "Total Claim (Provider+Reimburse)"})
+    )
+
+    reimburse_limit_map = limit_reimburse_unique[["NIK", "Year", "Benefit Limit"]].rename(
+        columns={"Benefit Limit": "Limit Reimburse"}
+    )
+
+    sim_all = total_claim_by_emp_year.merge(reimburse_limit_map, on=["NIK", "Year"], how="left")
+    sim_all["Over Limit Amount"] = (
+        sim_all["Total Claim (Provider+Reimburse)"] - sim_all["Limit Reimburse"]
+    ).clip(lower=0)
+    sim_all["Over Limit"] = sim_all["Over Limit Amount"] > 0
+
+    emp_info = fdf[["NIK", "Member Name", "Band", "Tipe Pegawai"]].drop_duplicates("NIK")
+    sim_over = (
+        sim_all.loc[sim_all["Over Limit"]]
+        .merge(emp_info, on="NIK", how="left")
+        .sort_values("Over Limit Amount", ascending=False)
+    )
+
+    sm1, sm2 = st.columns(2)
+    with sm1:
+        n_sim_over = sim_over["NIK"].nunique()
+        st.metric(
+            "Employees Over Limit Reimburse (Total Claim)",
+            f"{n_sim_over:,}".replace(",", "."),
+            f"{pct_of_total(n_sim_over, active_employees):.1f}% dari total"
+        )
+    with sm2:
+        st.metric("Total Over Limit Amount (Simulasi)", fmt_rp(sim_over["Over Limit Amount"].sum()))
+
+    if sim_over.empty:
+        st.info("Tidak ada NIK yang melebihi Limit Reimburse pada skenario ini.")
+    else:
+        sim_display = sim_over.copy()
+        sim_display.insert(0, "Rank", range(1, len(sim_display) + 1))
+        sim_display = sim_display[
+            [
+                "Rank", "NIK", "Member Name", "Band", "Year", "Tipe Pegawai",
+                "Total Claim (Provider+Reimburse)", "Limit Reimburse", "Over Limit Amount",
+            ]
+        ].rename(columns={
+            "Total Claim (Provider+Reimburse)": "Total Claim (Rp)",
+            "Limit Reimburse": "Limit Reimburse (Rp)",
+            "Over Limit Amount": "Over Limit Amount (Rp)",
+        })
+        st.dataframe(sim_display, use_container_width=True)
+
 # --------------------------------------------------------------------------
 # SECTION 5 — DI MANA TERDAPAT POTENSI EFISIENSI BIAYA?
 # --------------------------------------------------------------------------
 st.markdown('<div class="section-header">⑤ APA DAMPAK POTENSIAL DARI SKENARIO KEBIJAKAN?</div>', unsafe_allow_html=True)
 
 if not has_salary:
-    st.warning("Upload the salary mapping file in the sidebar to run this simulation.")
+    st.warning(
+        "No Reimburse limit (1x Monthly Salary) is available for the current filter, "
+        "so this simulation can't be run."
+    )
 else:
     # c1, c2 = st.columns(2)
 
@@ -1179,3 +1489,106 @@ st.caption("Catatan: Data berdasarkan transaksi pada rentang tahun terfilter dan
 
 with st.expander("🔍 View filtered raw data"):
     st.dataframe(fdf, use_container_width=True)
+
+# --------------------------------------------------------------------------
+# AI ASSISTANT — FLOATING CHAT BUTTON + OVERLAY
+# --------------------------------------------------------------------------
+st.markdown(
+    """
+    <style>
+    /* Floating action button (bottom-right) that toggles the chat overlay */
+    div.element-container:has(> div#chat-fab-anchor)
+        + div.element-container div[data-testid="stButton"] {
+        position: fixed;
+        bottom: 24px;
+        right: 24px;
+        z-index: 10000;
+        width: auto;
+    }
+    div.element-container:has(> div#chat-fab-anchor)
+        + div.element-container div[data-testid="stButton"] button {
+        width: 58px;
+        height: 58px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, #2f6fb0, #1b3a5c);
+        color: white !important;
+        font-size: 24px;
+        border: none;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+        padding: 0;
+        line-height: 1;
+    }
+    div.element-container:has(> div#chat-fab-anchor)
+        + div.element-container div[data-testid="stButton"] button:hover {
+        transform: scale(1.06);
+        box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+    }
+    div.element-container:has(> div#chat-fab-anchor)
+        + div.element-container div[data-testid="stButton"] button p {
+        font-size: 24px !important;
+    }
+
+    /* Overlay chat panel (bottom-right, above the FAB) */
+    div.element-container:has(> div#chat-panel-anchor)
+        + div.element-container div[data-testid="stVerticalBlockBorderWrapper"] {
+        position: fixed;
+        bottom: 96px;
+        right: 24px;
+        width: 380px;
+        max-width: 92vw;
+        z-index: 9999;
+        background: white;
+        border-radius: 16px;
+        box-shadow: 0 12px 40px rgba(0,0,0,0.28);
+        padding: 6px 6px 2px 6px;
+    }
+    @media (max-width: 480px) {
+        div.element-container:has(> div#chat-panel-anchor)
+            + div.element-container div[data-testid="stVerticalBlockBorderWrapper"] {
+            right: 12px;
+            bottom: 88px;
+            width: 92vw;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown('<div id="chat-fab-anchor"></div>', unsafe_allow_html=True)
+fab_icon = "✖️" if st.session_state.chat_open else "💬"
+if st.button(fab_icon, key="chat_fab_toggle", help="Tanya AI soal data ini"):
+    st.session_state.chat_open = not st.session_state.chat_open
+    st.rerun()
+
+if st.session_state.chat_open:
+    st.markdown('<div id="chat-panel-anchor"></div>', unsafe_allow_html=True)
+    with st.container(border=True):
+        st.markdown("**🤖 AI Health Benefit Assistant**")
+        st.caption("Tanya apa saja soal data yang sudah diupload.")
+
+        chat_box = st.container(height=360)
+        with chat_box:
+            if not st.session_state.messages:
+                st.caption("Belum ada percakapan. Coba tanya: “Top 5 employee claim tahun 2025”.")
+            for msg in st.session_state.messages:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+
+        prompt = st.chat_input("Ask anything about the data...", key="chat_overlay_input")
+        if prompt:
+            st.session_state.messages.append({"role": "user", "content": prompt})
+
+            with st.spinner("Analyzing data..."):
+                response = client.models.generate_content(
+                    model="gemini-3.5-flash",
+                    contents=[
+                        SYSTEM_PROMPT,
+                        st.session_state.gemini_file,
+                        prompt,
+                    ],
+                )
+                answer = response.text
+
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            st.rerun()
