@@ -782,7 +782,7 @@ def kpi_card(col, icon, color, title, value, sub):
 
 
 kpi_card(k1, "👥", NAVY, "Active Employees", f"{active_employees:,}".replace(",", "."),
-          f"{pct_of_total(active_employees, total_employees_all):.0f}% dari total")
+          "")
 kpi_card(k2, "🧾", NAVY, "Total Claim Amount", fmt_rp(total_claim),
           f"{min(sel_years) if sel_years else ''}–{max(sel_years) if sel_years else ''}")
 kpi_card(k3, "🛡️", BLUE, "Total Provider Claim", fmt_rp(provider_claim),
@@ -1348,7 +1348,7 @@ else:
         st.metric(
             "Employees Over Reimbursement Limit",
             f"{employees_over:,}".replace(",", "."),
-            ""
+            f"{pct_of_total(employees_over, active_employees):.1f}% dari total"
         )
     with m2:
         st.metric("Total Over Limit Amount", fmt_rp(over_df["Over Limit Amount"].sum()))
