@@ -1348,7 +1348,7 @@ else:
         st.metric(
             "Employees Over Reimbursement Limit",
             f"{employees_over:,}".replace(",", "."),
-            f"{pct_of_total(employees_over, active_employees):.1f}% dari total"
+            ""
         )
     with m2:
         st.metric("Total Over Limit Amount", fmt_rp(over_df["Over Limit Amount"].sum()))
